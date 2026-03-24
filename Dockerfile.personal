@@ -1,0 +1,116 @@
+# syntax=docker/dockerfile:1
+# Dockerfile.personal — Personal fork build for datasheet-manager stack
+#
+# Two build modes controlled by BUILD_MODE build arg:
+#
+#   backend-only (default, ~2 min rebuild):
+#     Layers our modified Python source on top of the official Label Studio image.
+#     Use this for all backend-only changes (new filter operators, API endpoints,
+#     bulk correction logic). Does NOT recompile the React frontend.
+#
+#   full (~30-60 min first build, fast on rebuild due to Docker layer cache):
+#     Builds everything from source (Node + Python multi-stage).
+#     Required when web/libs/datamanager/ or any other frontend file is changed.
+#
+# Usage in docker-compose:
+#   build:
+#     context: ../contributions/label-studio
+#     dockerfile: Dockerfile.personal
+#     args:
+#       BUILD_MODE: backend-only   # or: full
+
+ARG BUILD_MODE=backend-only
+
+# ─────────────────────────────────────────────────────────────
+# MODE: backend-only
+# Base = official image + our modified Python files on top
+# ─────────────────────────────────────────────────────────────
+FROM heartexlabs/label-studio:latest AS backend-only
+
+USER root
+
+# Install PostgreSQL client (needed for healthcheck scripts in the stack)
+RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create data directories (same as original datasheet-manager/labelstudio/Dockerfile)
+RUN mkdir -p /label-studio/data /label-studio/data/local-files \
+    && chown -R 1001:0 /label-studio/data
+
+# Overlay our modified Python source.
+# Docker cache will invalidate this layer only when label_studio/ changes.
+COPY --chown=1001:0 label_studio/ /label-studio/label_studio/
+
+USER 1001
+EXPOSE 8080
+WORKDIR /label-studio
+ENTRYPOINT ["./deploy/docker-entrypoint.sh"]
+CMD ["label-studio"]
+
+# ─────────────────────────────────────────────────────────────
+# MODE: full — build frontend assets from source
+# ─────────────────────────────────────────────────────────────
+FROM --platform=${BUILDPLATFORM:-linux/amd64} node:22-alpine AS frontend-builder-full
+ENV BUILD_NO_SERVER=true \
+    BUILD_NO_HASH=true \
+    BUILD_NO_CHUNKS=true \
+    BUILD_MODULE=true \
+    YARN_CACHE_FOLDER=/root/web/.yarn \
+    NX_CACHE_DIRECTORY=/root/web/.nx \
+    NODE_ENV=production \
+    NODE_OPTIONS="--max-old-space-size=4096"
+WORKDIR /label-studio/web
+COPY web .
+COPY pyproject.toml ../pyproject.toml
+RUN --mount=type=cache,target=/root/web/.yarn \
+    --mount=type=cache,target=/root/web/.nx \
+    npm install --global yarn && yarn install --frozen-lockfile && yarn build
+
+# Python venv build
+FROM python:3.13-slim AS venv-builder-full
+ARG POETRY_VERSION=2.3.2
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=off \
+    POETRY_HOME="/opt/poetry" \
+    POETRY_VIRTUALENVS_IN_PROJECT=true \
+    PATH="/opt/poetry/bin:$PATH"
+ADD https://install.python-poetry.org /tmp/install-poetry.py
+RUN python /tmp/install-poetry.py
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential git postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /label-studio
+ENV VENV_PATH="/label-studio/.venv"
+ENV PATH="$VENV_PATH/bin:$PATH"
+COPY pyproject.toml poetry.lock README.md ./
+RUN poetry check --lock && poetry install --no-root --without test --extras uwsgi
+COPY label_studio label_studio
+RUN poetry install --only-root --extras uwsgi \
+    && python3 label_studio/manage.py collectstatic --no-input
+
+# Final image for full mode
+FROM python:3.13-slim AS full
+ENV LS_DIR=/label-studio \
+    HOME=/label-studio \
+    LABEL_STUDIO_BASE_DATA_DIR=/label-studio/data \
+    PATH="/label-studio/.venv/bin:$PATH" \
+    DJANGO_SETTINGS_MODULE=core.settings.label_studio \
+    PYTHONUNBUFFERED=1
+WORKDIR /label-studio
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libexpat1 gnupg2 curl postgresql-client nginx \
+    && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /label-studio/data /label-studio/data/local-files \
+    && chown -R 1001:0 /label-studio /label-studio/data /var/log/nginx /etc/nginx
+COPY --chown=1001:0 deploy/default.conf /etc/nginx/nginx.conf
+COPY --chown=1001:0 pyproject.toml poetry.lock README.md LICENSE licenses deploy ./
+COPY --chown=1001:0 --from=venv-builder-full /label-studio /label-studio
+COPY --chown=1001:0 --from=frontend-builder-full /label-studio/web/dist /label-studio/web/dist
+USER 1001
+EXPOSE 8080
+ENTRYPOINT ["./deploy/docker-entrypoint.sh"]
+CMD ["label-studio"]
+
+# ─────────────────────────────────────────────────────────────
+# Final stage selector
+# ─────────────────────────────────────────────────────────────
+FROM ${BUILD_MODE}
